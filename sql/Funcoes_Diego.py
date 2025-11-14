@@ -27,10 +27,10 @@ def criar_planilha_auditoria():
     audit_workbook = Workbook()
     ws = audit_workbook.active
     cabecalhos = [
-        'ID', 'SENSOR A1', 'SENSOR A2', 'SENSOR R1 ENTRADA', 'SENSOR R2 ENTRADA',
-        'SENSOR R1 SAIDA', 'SENSOR R2 SAIDA', 'PERFIL', 'MDFE', 'PERFILOMETRIA',
-        'STATUS VALIDAÇÃO', 'METODO DE VALIDAÇÃO', 'CATEGORIA A SER VALIDADA',
-        'OCR', 'PLACA', 'TAG', 'OSA', 'LOCAL', 'VALOR REJEITADO', 'VALOR VALIDADO'
+        'COLUNA 1',
+        'COLUNA 2',
+        'COLUNA 3',
+        'COLUNA 4',
     ]
     for col, nome in enumerate(cabecalhos, start=1):
         ws.cell(row=1, column=col, value=nome)
@@ -73,9 +73,9 @@ def abrir_navegador():
     return browser, wait
 
 
-def login_toll(browser, usuario, senha):
-    """Realiza login no sistema Toll (exemplo genérico)"""
-    browser.get("https://sistema.toll.com.br")
+def login_toll(browser, usuario, senha, endereco):
+    """Realiza login em sistemas (exemplo genérico)"""
+    browser.get(endereco)
     browser.find_element("id", "username").send_keys(usuario)
     browser.find_element("id", "password").send_keys(senha)
     browser.find_element("id", "btnLogin").click()
@@ -119,20 +119,11 @@ def executar_consulta_em_blocos(
 def mapear_codigo_script(codigo: str) -> str:
     """Retorna o nome do script automático com base no código informado."""
     codigos = {
-        '1': 'Val_base_perfil_auto',
-        '2': 'Val_base_perfil_auto_EM',
-        '3': 'Val_base_TAG_auto',
-        '4': 'LISTA_OCR_AUTO',
-        '5': 'Valida_lista_placa_auto',
-        '6': 'Evasão_auto',
-        '7': 'Auxilio_Planilha_pago_auto',
-        '8': 'CONFERE_base_VALIDADOR_auto',
-        '9': 'teste_PERFILSENTIDO_OLHASENSOR',
-        '10': 'Reenvio_pagos_sem_aceite_auto',
-        '11': 'Val_base_perfil_auto_pago',
-        '12': 'Val_base_COB_auto_pago',
-        '13': 'Validação_SmartFlow_auto',
-        '14': 'Clica_FIC_02_auto',
+        '1': 'Nome do script',
+        '2': 'Nome do script',
+        '3': 'Nome do script',
+        '4': 'Nome do script',
+        '5': 'Nome do script'
     }
     return codigos.get(codigo, 'codigo_invalido')
 
