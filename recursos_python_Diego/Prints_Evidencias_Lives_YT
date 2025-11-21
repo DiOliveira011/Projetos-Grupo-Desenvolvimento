@@ -19,9 +19,10 @@ LINK_VIDEO = "https://www.youtube.com/live/frqviXLbExk?si=ssBNPD_uYK7dmFal"
 INTERVALO = 0.3  # segundos entre ciclos de captura
 TEMPLATES_SCALE_RANGE = (0.6, 1.4)  # range de escalas para buscar (min, max)
 TEMPLATES_SCALE_STEPS = 35  # quantas escalas testar
-MATCH_THRESHOLD = 0.55  # limiar para considerar detecção (ajustar conforme necessidade)
+MATCH_THRESHOLD = 0.67  # limiar para considerar detecção (ajustar conforme necessidade)
 NMS_IOU_THRESHOLD = 0.3  # para suprimir boxes duplicadas
 SIMULATE_USER = False  # mover mouse e clicar levemente para parecer humano
+INTERVALO_PRINTS = 20.0
 
 status_monitoramento = {"rodando": True, "parar": False}
 inicio = time.time()
@@ -311,7 +312,7 @@ def detectar_logo_com_scanner(frame, templates, driver, inicio, threshold=MATCH_
 
     # desenha overlay scanner (opcional visual)
     overlay = frame.copy()
-    passos = 40
+    passos = 80
     pos = int((time.time() - inicio) * 8) % passos
     y_scan = int(((y2-y1) / passos) * pos) + y1
     x_scan = int(((x2-x1) / passos) * pos) + x1
@@ -390,6 +391,7 @@ def monitorar_live(templates, pasta_evidencias):
                     caminho_arquivo = os.path.join(pasta_evidencias, nome_arquivo)
                     cv2.imwrite(caminho_arquivo, frame)
                     print(f"✅ Logo detectado ({tempo_live}) — print salvo: {caminho_arquivo}")
+                    time.sleep(20)
 
                     # salva thumbnails das detecções
                     for idx, (box, score, t_idx) in enumerate(resultados):
