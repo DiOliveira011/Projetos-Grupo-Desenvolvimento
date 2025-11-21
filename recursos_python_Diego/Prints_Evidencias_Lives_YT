@@ -1,0 +1,271 @@
+import cv2
+import numpy as np
+import os
+import time
+import threading
+from datetime import datetime
+from tkinter import Tk, Button, Label, filedialog
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# CONFIGURAÇÕES =====================================
+NOME_DA_LIVE = "TESTE"
+LINK_VIDEO = "https://www.youtube.com/live/frqviXLbExk?si=ssBNPD_uYK7dmFal"
+INTERVALO =   0.5 # segundos entre prints
+
+status_monitoramento = {"rodando": True, "parar": False}
+inicio = time.time()
+registros = []
+
+
+# SELECIONAR LOGOS
+# =====================================
+def selecionar_logos():
+    root = Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    caminhos_logos = filedialog.askopenfilenames(
+        title="Selecione o(s) logo(s) da live",
+        filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.gif")]
+    )
+    root.destroy()
+    return list(caminhos_logos)
+
+
+# PREPARAR PASTAS
+# =====================================
+def preparar_pastas(nome_live):
+    home = os.path.expanduser("~")
+    pasta_base = os.path.join(home, "Documents", "BOT_Prints_Lives")
+    pasta_evidencias = os.path.join(
+        pasta_base, "Evidencias", f"{nome_live}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    )
+    os.makedirs(pasta_evidencias, exist_ok=True)
+    return pasta_base, pasta_evidencias
+
+# DETECTAR LOGO (com visual)
+# =====================================
+def detectar_logo_com_scanner(frame, templates, driver, inicio, threshold=0.3, delay=0.001):
+    detectou = False
+    tempo_live = None
+
+    altura, largura, _ = frame.shape
+    overlay = frame.copy()
+
+  
+    try:
+        video_element = driver.find_element(By.XPATH, '//*[@id="movie_player"]')
+        location = video_element.location
+        size = video_element.size
+        x1, y1 = int(location['x']), int(location['y'])
+        x2, y2 = x1 + int(size['width']), y1 + int(size['height'])
+        roi = frame[y1:y2, x1:x2]  # só a região do vídeo
+    except:
+        roi = frame.copy()
+        x1, y1 = 0, 0
+        x2, y2 = largura, altura
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    resultados = []
+
+    for idx, template in enumerate(templates):
+        cv2.imshow(f"Template {idx+1} (procurando)", template)
+        cv2.waitKey(1)
+
+        res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
+        loc = np.where(res >= threshold)
+        for pt in zip(*loc[::-1]):
+            h, w = template.shape
+            resultados.append((pt, w, h))
+            detectou = True
+
+
+    passos = 60
+    direction = 1
+    pos = 0
+    brilho_base = 0.2  # rastro inicial
+
+    for _ in range(passos * 2):
+        overlay = frame.copy()
+
+        # posição das linhas
+        y = int((altura / passos) * pos)
+        x = int((largura / passos) * pos)
+
+        # desenha linhas scanner
+        cv2.line(overlay, (0, y), (largura, y), (0, 0, 255), 2)
+        cv2.line(overlay, (x, 0), (x, altura), (255, 0, 0), 2)
+
+        # rastro com variação de brilho
+        alpha = brilho_base + 0.6 * (pos / passos)
+        blend = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+        # desenha os quadrados dos resultados
+        for (pt, w, h) in resultados:
+            cv2.rectangle(blend[y1:y2, x1:x2], pt, (pt[0]+w, pt[1]+h), (0, 255, 0), 2)
+
+        # efeito de brilho pulsante nas linhas
+        linha_intensity = int(255 * abs((pos/passos) - 0.5) * 2)
+        cv2.line(blend, (0, y), (largura, y), (linha_intensity, 0, 255), 2)
+        cv2.line(blend, (x, 0), (x, altura), (0, linha_intensity, 255), 2)
+
+        cv2.imshow("Scanner", blend)
+        cv2.waitKey(1)
+        time.sleep(delay)
+
+        # atualiza posição
+        pos += direction
+        if pos >= passos or pos <= 0:
+            direction *= -1
+
+    if detectou:
+        try:
+            tempo_element = driver.find_element(
+                By.XPATH, '//*[@id="movie_player"]/div[27]/div[2]/div[1]/div[1]/span[1]/div/span[2]'
+            )
+            tempo_live = tempo_element.text.strip()
+        except:
+            tempo_decorrido = int(time.time() - inicio)
+            minutos = tempo_decorrido // 60
+            segundos = tempo_decorrido % 60
+            tempo_live = f"{minutos:02d}:{segundos:02d}"
+
+    return detectou, tempo_live
+
+
+# CONFIGURAR YOUTUBE
+# =====================================
+def configurar_youtube(driver):
+    driver.maximize_window()
+    wait = WebDriverWait(driver, 15)
+
+    # Reduzir zoom
+    driver.execute_script("document.body.style.zoom='80%'")
+
+    # Mais detalhes
+    try:
+        mais_detalhes = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="expand"]')))
+        mais_detalhes.click()
+        print("ℹ️ Mais detalhes clicado")
+    except:
+        print("⚠️ Botão Mais detalhes não encontrado ou não aplicável")
+
+
+
+    # Clicar no play
+    try:
+        play_btn = wait.until(EC.element_to_be_clickable(
+            (By.XPATH, '//*[@id="movie_player"]//button[contains(@class,"ytp-large-play-button")]')))
+        play_btn.click()
+        print("▶️ Play clicado pelo botão")
+    except:
+        print("⚠️ Botão Play não encontrado, tentando clicar na área do vídeo...")
+        try:
+            video_area = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="movie_player"]')))
+            video_area.click()
+            print("▶️ Play clicado na área do vídeo")
+        except:
+            print("⚠️ Não foi possível iniciar o vídeo")
+
+# MONITORAR LIVE (usa scanner e detecta logos)
+# =====================================
+def monitorar_live(templates, pasta_evidencias):
+    try:
+        chrome_options = Options()
+        chrome_options.add_argument("--start-maximized")
+        driver = webdriver.Chrome(options=chrome_options)
+        driver.get(LINK_VIDEO)
+        configurar_youtube(driver)
+        print("🚀 Live aberta e escaneando...")
+
+        global inicio
+        inicio = time.time()
+
+        while not status_monitoramento["parar"]:
+            if status_monitoramento["rodando"]:
+                png = driver.get_screenshot_as_png()
+                arr = np.frombuffer(png, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+                detectou, tempo_live = detectar_logo_com_scanner(frame, templates, driver, inicio)
+
+                if detectou:
+                    nome_arquivo = f"{NOME_DA_LIVE}_{tempo_live.replace(':','-')}.png"
+                    caminho_arquivo = os.path.join(pasta_evidencias, nome_arquivo)
+                    cv2.imwrite(caminho_arquivo, frame)
+                    print(f"✅ Logo detectado ({tempo_live}) — print salvo: {caminho_arquivo}")
+
+                time.sleep(INTERVALO)
+            else:
+                time.sleep(1)
+
+    except Exception as e:
+        print("❌ Erro no monitoramento:", e)
+    finally:
+        cv2.destroyAllWindows()
+        driver.quit()
+        print("🛑 Monitoramento encerrado.")
+
+# INTERFACE
+# =====================================
+def iniciar_interface():
+    root = Tk()
+    root.title(f"Controle Live - {NOME_DA_LIVE} Desenvolvido por Diego Oliveira")
+    root.geometry("250x150+50+50")
+    root.attributes("-topmost", True)
+    root.attributes("-alpha", 0.2) # Aqui altero entre 0.2  até 1.0 para ajustar a transparencia da janela aux. 
+
+    def on_enter(event): root.attributes("-alpha", 0.5)
+    def on_leave(event): root.attributes("-alpha", 0.3)
+    root.bind("<Enter>", on_enter)
+    root.bind("<Leave>", on_leave)
+
+    status_label = Label(root, text="Rodando", fg="green", font=("Arial", 14, "bold"))
+    status_label.pack(pady=5)
+
+    def atualizar_status():
+        if status_monitoramento["parar"]:
+            status_label.config(text="Parado", fg="red")
+        elif status_monitoramento["rodando"]:
+            status_label.config(text="Rodando", fg="green")
+        else:
+            status_label.config(text="Pausado", fg="orange")
+        root.after(500, atualizar_status)
+    atualizar_status()
+
+    def pausar():
+        status_monitoramento["rodando"] = not status_monitoramento["rodando"]
+        btn_pausar.config(text="Continuar" if not status_monitoramento["rodando"] else "Pausar")
+
+    btn_pausar = Button(root, text="Pausar", width=15, bg="green", fg="white",
+                        font=("Arial", 12, "bold"), command=pausar)
+    btn_pausar.pack(pady=10)
+
+    def parar():
+        status_monitoramento["parar"] = True
+        root.destroy()
+
+    btn_parar = Button(root, text="⛔ Parar", width=15, bg="red", fg="white",
+                       font=("Arial", 12, "bold"), command=parar)
+    btn_parar.pack(pady=10)
+
+    root.mainloop()
+
+# EXECUÇÃO PRINCIPAL
+# ===================================== 
+logos_selecionados = selecionar_logos()
+if not logos_selecionados:
+    raise Exception("Nenhum logo selecionado!")
+
+templates = [cv2.imread(l, cv2.IMREAD_GRAYSCALE) for l in logos_selecionados]
+
+pasta_base, pasta_evidencias = preparar_pastas(NOME_DA_LIVE)
+print("📁 Salvando prints em:", pasta_evidencias)
+
+t_monitor = threading.Thread(target=monitorar_live, args=(templates, pasta_evidencias))
+t_monitor.start()
+
+iniciar_interface()
