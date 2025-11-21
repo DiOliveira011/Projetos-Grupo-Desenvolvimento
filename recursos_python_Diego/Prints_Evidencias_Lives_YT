@@ -21,7 +21,7 @@ TEMPLATES_SCALE_RANGE = (0.6, 1.4)  # range de escalas para buscar (min, max)
 TEMPLATES_SCALE_STEPS = 35  # quantas escalas testar
 MATCH_THRESHOLD = 0.55  # limiar para considerar detecção (ajustar conforme necessidade)
 NMS_IOU_THRESHOLD = 0.3  # para suprimir boxes duplicadas
-SIMULATE_USER = True  # mover mouse e clicar levemente para parecer humano
+SIMULATE_USER = False  # mover mouse e clicar levemente para parecer humano
 
 status_monitoramento = {"rodando": True, "parar": False}
 inicio = time.time()
