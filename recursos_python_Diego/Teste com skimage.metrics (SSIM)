@@ -1,0 +1,563 @@
+import cv2
+import numpy as np
+import os
+import time
+import threading
+import random
+from datetime import datetime
+from tkinter import Tk, Button, Label, filedialog
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# optional SSIM if installed
+try:
+    from skimage.metrics import structural_similarity as ssim
+    _HAS_SSIM = True
+except Exception:
+    _HAS_SSIM = False
+
+# ===================== CONFIGURAÇÕES =====================
+NOME_DA_LIVE = "TESTE"
+LINK_VIDEO = "https://www.youtube.com/live/frqviXLbExk?si=ssBNPD_uYK7dmFal"
+INTERVALO = 0.3  # segundos entre ciclos de captura
+TEMPLATES_SCALE_RANGE = (0.6, 1.4)  # range de escalas para buscar (min, max)
+TEMPLATES_SCALE_STEPS = 35  # quantas escalas testar
+MATCH_THRESHOLD = 0.55  # limiar para considerar detecção (ajustar conforme necessidade)
+NMS_IOU_THRESHOLD = 0.3  # para suprimir boxes duplicadas
+SIMULATE_USER = False  # mover mouse e clicar levemente para parecer humano
+
+# Delay mínimo entre saves (15s solicitado)
+INTERVALO_PRINTS = 20.0
+
+# ROI dinâmica
+roi_fixa = None          # (x1,y1,x2,y2) depois que definimos a região fixa
+roi_margem = 48          # margem em pixels ao redor do box detectado para formar ROI fixa
+roi_miss_limit = 8       # se não detectar na ROI por esse nº de ciclos, volta a escanear tudo
+roi_miss_count = 0
+
+# Resolução e zoom assumidos
+TARGET_WINDOW_SIZE = (1920, 1080)
+PAGE_ZOOM = 0.75  # 75%
+
+status_monitoramento = {"rodando": True, "parar": False}
+inicio = time.time()
+registros = []
+
+# ===================== UTILITÁRIOS =====================
+def selecionar_logos():
+    root = Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    caminhos_logos = filedialog.askopenfilenames(
+        title="Selecione o(s) logo(s) da live",
+        filetypes=[("Imagens", "*.png *.jpg *.jpeg *.bmp *.gif")]
+    )
+    root.destroy()
+    return list(caminhos_logos)
+
+def preparar_pastas(nome_live):
+    home = os.path.expanduser("~")
+    pasta_base = os.path.join(home, "Documents", "BOT_Prints_Lives")
+    pasta_evidencias = os.path.join(
+        pasta_base, "Evidencias", f"{nome_live}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    )
+    os.makedirs(pasta_evidencias, exist_ok=True)
+    return pasta_base, pasta_evidencias
+
+def non_max_suppression(boxes, scores, iou_threshold):
+    if not boxes:
+        return []
+    boxes_arr = np.array(boxes)
+    x1 = boxes_arr[:,0]
+    y1 = boxes_arr[:,1]
+    x2 = boxes_arr[:,0] + boxes_arr[:,2]
+    y2 = boxes_arr[:,1] + boxes_arr[:,3]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = np.argsort(scores)[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    return keep
+
+# ===================== STEALTH / CHROME OPTIONS =====================
+def criar_driver_stealth(window_size=TARGET_WINDOW_SIZE, page_zoom=PAGE_ZOOM):
+    chrome_options = Options()
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.add_argument("--disable-infobars")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    )
+    prefs = {
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.default_content_setting_values.media_stream_mic": 1,
+        "profile.default_content_setting_values.media_stream_camera": 1
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+
+    driver = webdriver.Chrome(options=chrome_options)
+    # scripts para mascarar navigator.webdriver e polir fingerprint básico
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR','pt'] });
+            """
+        })
+    except Exception:
+        try:
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        except Exception:
+            pass
+
+    # set window size and zoom
+    try:
+        driver.set_window_size(window_size[0], window_size[1])
+        # adjust page zoom (some pages respect it)
+        driver.execute_script(f"document.body.style.zoom='{page_zoom * 100}%'")
+    except Exception:
+        pass
+
+    return driver
+
+# ===================== MAPEAR ÁREA DO PLAYER PARA O FRAME =====================
+def get_video_rect_from_dom(driver):
+    try:
+        script = """
+            const el = document.querySelector('#movie_player');
+            if (!el) return null;
+            const rect = el.getBoundingClientRect();
+            return {
+                x: rect.left,
+                y: rect.top,
+                width: rect.width,
+                height: rect.height,
+                innerW: window.innerWidth,
+                innerH: window.innerHeight,
+                dpr: window.devicePixelRatio || 1
+            };
+        """
+        res = driver.execute_script(script)
+        return res
+    except Exception:
+        return None
+
+def map_dom_rect_to_frame(rect, frame_shape):
+    if not rect:
+        return None
+    frame_h, frame_w = frame_shape[:2]
+    innerW = rect.get('innerW', None)
+    innerH = rect.get('innerH', None)
+    dpr = rect.get('dpr', 1)
+    if innerW and innerH:
+        scale_x = frame_w / innerW
+        scale_y = frame_h / innerH
+        x1 = int(rect['x'] * scale_x)
+        y1 = int(rect['y'] * scale_y)
+        w = int(rect['width'] * scale_x)
+        h = int(rect['height'] * scale_y)
+        x1 = max(0, min(x1, frame_w-1))
+        y1 = max(0, min(y1, frame_h-1))
+        x2 = max(0, min(x1 + w, frame_w))
+        y2 = max(0, min(y1 + h, frame_h))
+        return x1, y1, x2, y2
+    return None
+
+def fallback_center_16_9(frame_shape):
+    h, w = frame_shape[:2]
+    video_h = int(w * 9 / 16)
+    if video_h > h:
+        video_h = h
+        video_w = int(h * 16 / 9)
+    else:
+        video_w = w
+    x1 = (w - video_w)//2
+    y1 = (h - video_h)//2
+    x2 = x1 + video_w
+    y2 = y1 + video_h
+    return x1, y1, x2, y2
+
+# ===================== DETECÇÃO REFINADA (MULTI-ESCALA + NMS + SSIM) =====================
+def detectar_logo_multiescala(roi_gray, templates, scale_min, scale_max, steps, threshold):
+    detections = []
+    h_roi, w_roi = roi_gray.shape[:2]
+
+    # Pré-process ROI
+    roi_eq = cv2.equalizeHist(roi_gray)
+    roi_blur = cv2.bilateralFilter(roi_eq, 5, 50, 50)
+    roi_edges = cv2.Canny(roi_blur, 50, 150)
+
+    scales = np.linspace(scale_min, scale_max, steps)
+    for t_idx, tmpl in enumerate(templates):
+        if tmpl is None:
+            continue
+        tmpl_eq = cv2.equalizeHist(tmpl)
+        tmpl_edges = cv2.Canny(tmpl_eq, 50, 150)
+        th, tw = tmpl_eq.shape[:2]
+        for s in scales:
+            nw = max(3, int(tw * s))
+            nh = max(3, int(th * s))
+            if nw >= w_roi or nh >= h_roi:
+                continue
+            resized = cv2.resize(tmpl_eq, (nw, nh), interpolation=cv2.INTER_AREA)
+            resized_edges = cv2.resize(tmpl_edges, (nw, nh), interpolation=cv2.INTER_AREA)
+
+            # dois matches: borda e aparência
+            try:
+                res_edges = cv2.matchTemplate(roi_edges, resized_edges, cv2.TM_CCOEFF_NORMED)
+            except Exception:
+                res_edges = np.zeros((max(1, roi_edges.shape[0]-resized_edges.shape[0]+1), max(1, roi_edges.shape[1]-resized_edges.shape[1]+1)))
+            try:
+                res_norm = cv2.matchTemplate(roi_blur, resized, cv2.TM_CCOEFF_NORMED)
+            except Exception:
+                res_norm = np.zeros((max(1, roi_blur.shape[0]-resized.shape[0]+1), max(1, roi_blur.shape[1]-resized.shape[1]+1)))
+
+            # combinar scores (ponderação leve)
+            # assegurar shapes compatíveis
+            h_res, w_res = res_norm.shape
+            combined = np.zeros_like(res_norm)
+            # align sizes: we'll use min area of both results (they should match)
+            try:
+                combined = (res_norm * 0.55) + (res_edges * 0.45)
+            except Exception:
+                combined = res_norm
+
+            loc = np.where(combined >= threshold)
+            for (py, px) in zip(*loc):
+                score = float(combined[py, px])
+                # quick SSIM check (fallback to skip if shape mismatch)
+                if _HAS_SSIM:
+                    rec = roi_blur[py:py + nh, px:px + nw]
+                    if rec.shape[:2] == resized.shape[:2]:
+                        try:
+                            score_ssim = ssim(resized, rec)
+                            # exige que a similaridade estrutural passe um patamar baixo
+                            if score_ssim < 0.45:
+                                continue
+                        except Exception:
+                            pass
+                detections.append((int(px), int(py), nw, nh, score, t_idx))
+
+    if not detections:
+        return []
+    boxes = [(d[0], d[1], d[2], d[3]) for d in detections]
+    scores = [d[4] for d in detections]
+    keep_idxs = non_max_suppression(boxes, scores, NMS_IOU_THRESHOLD)
+    filtered = [detections[i] for i in keep_idxs]
+    filtered.sort(key=lambda x: x[4], reverse=True)
+    return filtered
+
+# ===================== FUNÇÕES DE UI/INTERAÇÃO SIMULADA =====================
+def ensure_play(driver):
+    try:
+        wait = WebDriverWait(driver, 8)
+        play_btn = wait.until(EC.element_to_be_clickable(
+            (By.XPATH, '//*[@id="movie_player"]//button[contains(@class,"ytp-large-play-button")]')
+        ))
+        play_btn.click()
+        return True
+    except Exception:
+        try:
+            video_area = driver.find_element(By.CSS_SELECTOR, '#movie_player')
+            ActionChains(driver).move_to_element(video_area).click().perform()
+            return True
+        except Exception:
+            return False
+
+def simulate_small_user_action(driver):
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, '#movie_player')
+        actions = ActionChains(driver)
+        w = el.size['width']
+        h = el.size['height']
+        offset_x = int((w//4) * (random.random() - 0.5))
+        offset_y = int((h//4) * (random.random() - 0.5))
+        actions.move_to_element_with_offset(el, w//2 + offset_x, h//2 + offset_y)
+        actions.pause(random.random()*0.2)
+        if random.random() < 0.35:
+            actions.click()
+        actions.perform()
+    except Exception:
+        pass
+
+# ===================== FUNÇÃO PRINCIPAL DE MONITORAMENTO =====================
+def detectar_logo_com_scanner(frame, templates, driver, inicio, threshold=MATCH_THRESHOLD):
+    global roi_fixa, roi_miss_count
+    detectou = False
+    tempo_live = None
+    altura, largura, _ = frame.shape
+
+    # mapear player DOM -> frame coords (com zoom já aplicado pelo chrome)
+    rect = get_video_rect_from_dom(driver)
+    mapa = map_dom_rect_to_frame(rect, frame.shape) if rect else None
+    if mapa:
+        vid_x1, vid_y1, vid_x2, vid_y2 = mapa
+    else:
+        vid_x1, vid_y1, vid_x2, vid_y2 = fallback_center_16_9(frame.shape)
+
+    # se tivermos ROI fixa, usa ela (ajustada à região do vídeo)
+    if roi_fixa:
+        x1, y1, x2, y2 = roi_fixa
+        # garantir dentro do player bounds
+        x1 = max(vid_x1, x1); y1 = max(vid_y1, y1)
+        x2 = min(vid_x2, x2); y2 = min(vid_y2, y2)
+    else:
+        x1, y1, x2, y2 = vid_x1, vid_y1, vid_x2, vid_y2
+
+    roi = frame[y1:y2, x1:x2].copy()
+    if roi.size == 0:
+        roi = frame.copy()
+        x1, y1, x2, y2 = 0, 0, largura, altura
+
+    # pre-process
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5,5), 0)
+
+    # detecta
+    detections = detectar_logo_multiescala(
+        gray, templates, TEMPLATES_SCALE_RANGE[0], TEMPLATES_SCALE_RANGE[1], TEMPLATES_SCALE_STEPS, threshold
+    )
+
+    resultados = []
+    for (rx, ry, rw, rh, score, t_idx) in detections:
+        ax1 = x1 + rx
+        ay1 = y1 + ry
+        ax2 = ax1 + rw
+        ay2 = ay1 + rh
+        resultados.append(((ax1, ay1, ax2, ay2), score, t_idx))
+
+    # debug overlay (opcional, sem flashes)
+    try:
+        overlay = frame.copy()
+        for (box, score, t_idx) in resultados:
+            ax1, ay1, ax2, ay2 = box
+            cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (0,255,0), 2)
+            cv2.putText(overlay, f"{score:.2f}", (ax1, max(ay1-6,0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+        cv2.imshow("Scanner", overlay)
+        cv2.waitKey(1)
+    except Exception:
+        pass
+
+    if resultados:
+        detectou = True
+        # Atualiza ROI fixa se ainda não foi definida
+        if roi_fixa is None:
+            # pega a melhor detecção (primeira ordenada por score)
+            best_box, best_score, best_t = resultados[0]
+            bx1, by1, bx2, by2 = best_box
+            # expande com margem
+            mx1 = max(0, bx1 - roi_margem)
+            my1 = max(0, by1 - roi_margem)
+            mx2 = min(largura, bx2 + roi_margem)
+            my2 = min(altura, by2 + roi_margem)
+            # garantir que esteja dentro do player area
+            mx1 = max(mx1, vid_x1); my1 = max(my1, vid_y1)
+            mx2 = min(mx2, vid_x2); my2 = min(my2, vid_y2)
+            roi_fixa = (mx1, my1, mx2, my2)
+            print(f"📌 ROI fixa definida: {roi_fixa}")
+
+        # reset miss counter quando encontrar
+        roi_miss_count = 0
+
+        # pegar tempo do player via JS (se disponível)
+        try:
+            tempo_element = driver.execute_script("""
+                try {
+                    const s = document.querySelector('#movie_player .ytp-time-display .ytp-time-current');
+                    return s ? s.innerText.trim() : null;
+                } catch(e) { return null; }
+            """)
+            tempo_live = tempo_element if tempo_element else None
+        except Exception:
+            tempo_live = None
+
+        if not tempo_live:
+            tempo_decorrido = int(time.time() - inicio)
+            minutos = tempo_decorrido // 60
+            segundos = tempo_decorrido % 60
+            tempo_live = f"{minutos:02d}:{segundos:02d}"
+
+    else:
+        # sem resultados
+        if roi_fixa:
+            roi_miss_count += 1
+            # se passar do limite, limpa a roi_fixa e volta a escanear tudo
+            if roi_miss_count >= roi_miss_limit:
+                print("🔁 ROI fixa perdeu rastreamento — voltando a escanear toda a área do player.")
+                roi_fixa = None
+                roi_miss_count = 0
+
+    return detectou, tempo_live, resultados
+
+def monitorar_live(templates, pasta_evidencias):
+    global inicio
+    ultimo_print_time = 0.0
+    try:
+        driver = criar_driver_stealth()
+        driver.get(LINK_VIDEO)
+        time.sleep(2)
+        # tenta reduzir zoom do conteúdo (em pct)
+        try:
+            driver.execute_script(f"document.body.style.zoom='{int(PAGE_ZOOM*100)}%'")
+        except Exception:
+            pass
+        ensure_play(driver)
+        print("🚀 Live aberta e iniciada (tentativa).")
+
+        inicio = time.time()
+        ciclo = 0
+        while not status_monitoramento["parar"]:
+            if status_monitoramento["rodando"]:
+                ciclo += 1
+                try:
+                    png = driver.get_screenshot_as_png()
+                    arr = np.frombuffer(png, dtype=np.uint8)
+                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                except Exception as e:
+                    print("❌ Erro ao capturar screenshot:", e)
+                    time.sleep(INTERVALO)
+                    continue
+
+                detectou, tempo_live, resultados = detectar_logo_com_scanner(frame, templates, driver, inicio, MATCH_THRESHOLD)
+
+                if detectou:
+                    now = time.time()
+                    if now - ultimo_print_time >= INTERVALO_PRINTS:
+                        ultimo_print_time = now
+                        nome_arquivo = f"{NOME_DA_LIVE}_{tempo_live.replace(':','-')}_{ciclo}.png"
+                        caminho_arquivo = os.path.join(pasta_evidencias, nome_arquivo)
+                        try:
+                            cv2.imwrite(caminho_arquivo, frame)
+                            print(f"✅ Logo detectado ({tempo_live}) — print salvo: {caminho_arquivo}")
+                        except Exception as e:
+                            print("❌ Falha ao salvar screenshot:", e)
+
+                        # salva thumbnails das detecções
+                        for idx, (box, score, t_idx) in enumerate(resultados):
+                            ax1, ay1, ax2, ay2 = box
+                            pad = 6
+                            sx1, sy1 = max(0, ax1-pad), max(0, ay1-pad)
+                            sx2, sy2 = min(frame.shape[1], ax2+pad), min(frame.shape[0], ay2+pad)
+                            thumb = frame[sy1:sy2, sx1:sx2]
+                            thumb_name = f"{NOME_DA_LIVE}_{tempo_live.replace(':','-')}_det{idx}_t{t_idx}.png"
+                            try:
+                                cv2.imwrite(os.path.join(pasta_evidencias, thumb_name), thumb)
+                                print(f"   ↳ thumbnail salvo: {thumb_name} (score {score:.2f})")
+                            except Exception as e:
+                                print("   ❌ falha ao salvar thumbnail:", e)
+                    else:
+                        restante = INTERVALO_PRINTS - (now - ultimo_print_time)
+                        print(f"⏳ Detectado, mas aguardando intervalo ({restam := int(restante)}s) para salvar novo print...")
+                # ação humana leve periodicamente
+                if SIMULATE_USER and random.random() < 0.12:
+                    simulate_small_user_action(driver)
+
+                time.sleep(INTERVALO)
+            else:
+                time.sleep(0.5)
+
+    except Exception as e:
+        print("❌ Erro no monitoramento:", e)
+    finally:
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        print("🛑 Monitoramento encerrado.")
+
+# ===================== FUNÇÃO DE CONFIGURAR YOUTUBE (compatível) =====================
+def configurar_youtube(driver):
+    # mantida por compatibilidade (não usada fortemente aqui)
+    return
+
+# ===================== INTERFACE =====================
+def iniciar_interface():
+    root = Tk()
+    root.title(f"Controle Live - {NOME_DA_LIVE} Desenvolvido por Diego Oliveira")
+    root.geometry("300x170+50+50")
+    root.attributes("-topmost", True)
+    root.attributes("-alpha", 0.25)
+
+    def on_enter(event): root.attributes("-alpha", 0.5)
+    def on_leave(event): root.attributes("-alpha", 0.3)
+    root.bind("<Enter>", on_enter)
+    root.bind("<Leave>", on_leave)
+
+    status_label = Label(root, text="Rodando", fg="green", font=("Arial", 14, "bold"))
+    status_label.pack(pady=5)
+
+    def atualizar_status():
+        if status_monitoramento["parar"]:
+            status_label.config(text="Parado", fg="red")
+        elif status_monitoramento["rodando"]:
+            status_label.config(text="Rodando", fg="green")
+        else:
+            status_label.config(text="Pausado", fg="orange")
+        root.after(500, atualizar_status)
+    atualizar_status()
+
+    def pausar():
+        status_monitoramento["rodando"] = not status_monitoramento["rodando"]
+        btn_pausar.config(text="Continuar" if not status_monitoramento["rodando"] else "Pausar")
+    btn_pausar = Button(root, text="Pausar", width=18, bg="green", fg="white",
+                        font=("Arial", 12, "bold"), command=pausar)
+    btn_pausar.pack(pady=8)
+
+    def parar():
+        status_monitoramento["parar"] = True
+        root.destroy()
+    btn_parar = Button(root, text="⛔ Parar", width=18, bg="red", fg="white",
+                       font=("Arial", 12, "bold"), command=parar)
+    btn_parar.pack(pady=6)
+
+    root.mainloop()
+
+# ===================== EXECUÇÃO PRINCIPAL =====================
+if __name__ == "__main__":
+    logos_selecionados = selecionar_logos()
+    if not logos_selecionados:
+        raise Exception("Nenhum logo selecionado!")
+
+    templates = []
+    for l in logos_selecionados:
+        t = cv2.imread(l, cv2.IMREAD_GRAYSCALE)
+        if t is None:
+            print("⚠️ Não foi possível abrir template:", l)
+        else:
+            templates.append(t)
+
+    pasta_base, pasta_evidencias = preparar_pastas(NOME_DA_LIVE)
+    print("📁 Salvando prints em:", pasta_evidencias)
+
+    t_monitor = threading.Thread(target=monitorar_live, args=(templates, pasta_evidencias), daemon=True)
+    t_monitor.start()
+
+    iniciar_interface()
