@@ -3,26 +3,31 @@ import numpy as np
 import os
 import time
 import threading
+import random
 from datetime import datetime
 from tkinter import Tk, Button, Label, filedialog
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# CONFIGURAÇÕES =====================================
+# ===================== CONFIGURAÇÕES =====================
 NOME_DA_LIVE = "TESTE"
 LINK_VIDEO = "https://www.youtube.com/live/frqviXLbExk?si=ssBNPD_uYK7dmFal"
-INTERVALO =   0.5 # segundos entre prints
+INTERVALO = 0.3  # segundos entre ciclos de captura
+TEMPLATES_SCALE_RANGE = (0.6, 1.4)  # range de escalas para buscar (min, max)
+TEMPLATES_SCALE_STEPS = 35  # quantas escalas testar
+MATCH_THRESHOLD = 0.55  # limiar para considerar detecção (ajustar conforme necessidade)
+NMS_IOU_THRESHOLD = 0.3  # para suprimir boxes duplicadas
+SIMULATE_USER = True  # mover mouse e clicar levemente para parecer humano
 
 status_monitoramento = {"rodando": True, "parar": False}
 inicio = time.time()
 registros = []
 
-
-# SELECIONAR LOGOS
-# =====================================
+# ===================== UTILITÁRIOS =====================
 def selecionar_logos():
     root = Tk()
     root.withdraw()
@@ -34,9 +39,6 @@ def selecionar_logos():
     root.destroy()
     return list(caminhos_logos)
 
-
-# PREPARAR PASTAS
-# =====================================
 def preparar_pastas(nome_live):
     home = os.path.expanduser("~")
     pasta_base = os.path.join(home, "Documents", "BOT_Prints_Lives")
@@ -46,177 +48,398 @@ def preparar_pastas(nome_live):
     os.makedirs(pasta_evidencias, exist_ok=True)
     return pasta_base, pasta_evidencias
 
-# DETECTAR LOGO (com visual)
-# =====================================
-def detectar_logo_com_scanner(frame, templates, driver, inicio, threshold=0.3, delay=0.001):
+def non_max_suppression(boxes, scores, iou_threshold):
+    """
+    boxes: list of (x,y,w,h)
+    scores: list of floats
+    returns filtered indices
+    """
+    if not boxes:
+        return []
+    boxes_arr = np.array(boxes)
+    x1 = boxes_arr[:,0]
+    y1 = boxes_arr[:,1]
+    x2 = boxes_arr[:,0] + boxes_arr[:,2]
+    y2 = boxes_arr[:,1] + boxes_arr[:,3]
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = np.argsort(scores)[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    return keep
+
+# ===================== STEALTH / CHROME OPTIONS =====================
+def criar_driver_stealth(window_size=(1280, 800)):
+    chrome_options = Options()
+
+    # args úteis
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.add_argument("--disable-infobars")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-gpu")
+    # Ajuste do user-agent (coloque um real se preferir)
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    )
+
+    # Preferências que podem ajudar (não permitir notificações etc)
+    prefs = {
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.default_content_setting_values.media_stream_mic": 1,
+        "profile.default_content_setting_values.media_stream_camera": 1
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+
+    driver = webdriver.Chrome(options=chrome_options)
+    try:
+        # Pequeno set de scripts para mascarar navigator.webdriver etc
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                window.chrome = { runtime: {} };
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['pt-BR','pt'] });
+            """
+        })
+    except Exception:
+        # fallback - ainda vale tentar
+        try:
+            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        except Exception:
+            pass
+
+    # define tamanho de janela
+    driver.set_window_size(window_size[0], window_size[1])
+    return driver
+
+# ===================== MAPEAR ÁREA DO PLAYER PARA O FRAME =====================
+def get_video_rect_from_dom(driver):
+    """
+    Tenta pegar bounding rect do elemento #movie_player e retorna um dict com:
+    { 'x':..., 'y':..., 'width':..., 'height':..., 'innerWidth':..., 'innerHeight':..., 'devicePixelRatio': ... }
+    retorna None em caso de falha
+    """
+    try:
+        script = """
+            const el = document.querySelector('#movie_player');
+            if (!el) return null;
+            const rect = el.getBoundingClientRect();
+            return {
+                x: rect.left,
+                y: rect.top,
+                width: rect.width,
+                height: rect.height,
+                innerW: window.innerWidth,
+                innerH: window.innerHeight,
+                dpr: window.devicePixelRatio || 1
+            };
+        """
+        res = driver.execute_script(script)
+        return res
+    except Exception:
+        return None
+
+def map_dom_rect_to_frame(rect, frame_shape):
+    """
+    Mapeia valores do DOM (pixels CSS) para pixels do screenshot (frame).
+    Usa innerWidth/innerHeight para calcular escala.
+    """
+    if not rect:
+        return None
+    frame_h, frame_w = frame_shape[:2]
+    innerW = rect.get('innerW', None)
+    innerH = rect.get('innerH', None)
+    dpr = rect.get('dpr', 1)
+    if innerW and innerH:
+        scale_x = frame_w / innerW
+        scale_y = frame_h / innerH
+        x1 = int(rect['x'] * scale_x)
+        y1 = int(rect['y'] * scale_y)
+        w = int(rect['width'] * scale_x)
+        h = int(rect['height'] * scale_y)
+        # corrige limites
+        x1 = max(0, min(x1, frame_w-1))
+        y1 = max(0, min(y1, frame_h-1))
+        x2 = max(0, min(x1 + w, frame_w))
+        y2 = max(0, min(y1 + h, frame_h))
+        return x1, y1, x2, y2
+    return None
+
+def fallback_center_16_9(frame_shape):
+    h, w = frame_shape[:2]
+    video_h = int(w * 9 / 16)
+    if video_h > h:
+        video_h = h
+        video_w = int(h * 16 / 9)
+    else:
+        video_w = w
+    x1 = (w - video_w)//2
+    y1 = (h - video_h)//2
+    x2 = x1 + video_w
+    y2 = y1 + video_h
+    return x1, y1, x2, y2
+
+# ===================== DETECÇÃO REFINADA (MULTI-ESCALA + NMS) =====================
+def detectar_logo_multiescala(roi_gray, templates, scale_min, scale_max, steps, threshold):
+    """
+    roi_gray: imagem em grayscale onde procurar
+    templates: lista de templates (grayscale)
+    retorna: list of detections como (x, y, w, h, score, template_idx)
+    """
+    detections = []
+    h_roi, w_roi = roi_gray.shape[:2]
+    scales = np.linspace(scale_min, scale_max, steps)
+    for t_idx, tmpl in enumerate(templates):
+        # pré-process template
+        if tmpl is None:
+            continue
+        tmpl = cv2.GaussianBlur(tmpl, (3,3), 0)
+        th, tw = tmpl.shape[:2]
+        for s in scales:
+            nw = max(3, int(tw * s))
+            nh = max(3, int(th * s))
+            if nw >= w_roi or nh >= h_roi:
+                continue
+            resized = cv2.resize(tmpl, (nw, nh), interpolation=cv2.INTER_AREA)
+            res = cv2.matchTemplate(roi_gray, resized, cv2.TM_CCOEFF_NORMED)
+            # procurar picos acima do threshold
+            loc = np.where(res >= threshold)
+            for (py, px) in zip(*loc):
+                score = float(res[py, px])
+                detections.append((int(px), int(py), nw, nh, score, t_idx))
+    # aplicar NMS
+    if not detections:
+        return []
+    boxes = [(d[0], d[1], d[2], d[3]) for d in detections]
+    scores = [d[4] for d in detections]
+    keep_idxs = non_max_suppression(boxes, scores, NMS_IOU_THRESHOLD)
+    filtered = [detections[i] for i in keep_idxs]
+    # ordena por score decrescente
+    filtered.sort(key=lambda x: x[4], reverse=True)
+    return filtered
+
+# ===================== FUNÇÕES DE UI/INTERAÇÃO SIMULADA =====================
+def ensure_play(driver):
+    """
+    Tenta clicar no play ou na área do vídeo para iniciar/ativar o player.
+    """
+    try:
+        wait = WebDriverWait(driver, 8)
+        # tenta botão grande de play
+        play_btn = wait.until(EC.element_to_be_clickable(
+            (By.XPATH, '//*[@id="movie_player"]//button[contains(@class,"ytp-large-play-button")]')
+        ))
+        play_btn.click()
+        return True
+    except Exception:
+        try:
+            video_area = driver.find_element(By.CSS_SELECTOR, '#movie_player')
+            ActionChains(driver).move_to_element(video_area).click().perform()
+            return True
+        except Exception:
+            return False
+
+def simulate_small_user_action(driver):
+    """
+    Move o mouse levemente e clica em posições aleatórias dentro do player — para evitar que o vídeo
+    pause por inatividade ou para reduzir sinais de bot.
+    """
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, '#movie_player')
+        actions = ActionChains(driver)
+        # pega posição relativa pequena
+        w = el.size['width']
+        h = el.size['height']
+        # escolhe um ponto aleatório próximo do centro
+        offset_x = int((w//4) * (random.random() - 0.5))
+        offset_y = int((h//4) * (random.random() - 0.5))
+        actions.move_to_element_with_offset(el, w//2 + offset_x, h//2 + offset_y)
+        # movimento leve e clique opcional
+        actions.pause(random.random()*0.2)
+        # às vezes apenas move, às vezes clica
+        if random.random() < 0.4:
+            actions.click()
+        actions.perform()
+    except Exception:
+        pass
+
+# ===================== FUNÇÃO PRINCIPAL DE MONITORAMENTO =====================
+def detectar_logo_com_scanner(frame, templates, driver, inicio, threshold=MATCH_THRESHOLD, delay=0.001):
     detectou = False
     tempo_live = None
-
     altura, largura, _ = frame.shape
-    overlay = frame.copy()
 
-  
-    try:
-        video_element = driver.find_element(By.XPATH, '//*[@id="movie_player"]')
-        location = video_element.location
-        size = video_element.size
-        x1, y1 = int(location['x']), int(location['y'])
-        x2, y2 = x1 + int(size['width']), y1 + int(size['height'])
-        roi = frame[y1:y2, x1:x2]  # só a região do vídeo
-    except:
+    # tenta obter rect diretamente do DOM e mapear para frame
+    rect = get_video_rect_from_dom(driver)
+    mapa = map_dom_rect_to_frame(rect, frame.shape) if rect else None
+    if mapa:
+        x1, y1, x2, y2 = mapa
+    else:
+        x1, y1, x2, y2 = fallback_center_16_9(frame.shape)
+
+    # corta apenas a ROI do player
+    roi = frame[y1:y2, x1:x2].copy()
+    if roi.size == 0:
         roi = frame.copy()
-        x1, y1 = 0, 0
-        x2, y2 = largura, altura
+        x1, y1, x2, y2 = 0, 0, largura, altura
 
+    # pre-process
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (5,5), 0)
+
+    # detecta com multi-escala
+    detections = detectar_logo_multiescala(
+        gray, templates, TEMPLATES_SCALE_RANGE[0], TEMPLATES_SCALE_RANGE[1], TEMPLATES_SCALE_STEPS, threshold
+    )
+
+    # desenha overlay scanner (opcional visual)
+    overlay = frame.copy()
+    passos = 40
+    pos = int((time.time() - inicio) * 8) % passos
+    y_scan = int(((y2-y1) / passos) * pos) + y1
+    x_scan = int(((x2-x1) / passos) * pos) + x1
+    cv2.line(overlay, (x1, y_scan), (x2, y_scan), (0, 0, 255), 2)
+    cv2.line(overlay, (x_scan, y1), (x_scan, y2), (255, 0, 0), 2)
+
     resultados = []
+    for (rx, ry, rw, rh, score, t_idx) in detections:
+        # coords relativas -> absolutas na tela
+        ax1 = x1 + rx
+        ay1 = y1 + ry
+        ax2 = ax1 + rw
+        ay2 = ay1 + rh
+        resultados.append(((ax1, ay1, ax2, ay2), score, t_idx))
 
-    for idx, template in enumerate(templates):
-        cv2.imshow(f"Template {idx+1} (procurando)", template)
+        # desenha box no overlay
+        cv2.rectangle(overlay, (ax1, ay1), (ax2, ay2), (0,255,0), 2)
+        cv2.putText(overlay, f"{score:.2f}", (ax1, max(ay1-6,0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1)
+
+    # Mostrar janela scanner (pode fechar se rodando headless)
+    try:
+        cv2.imshow("Scanner", overlay)
         cv2.waitKey(1)
+    except Exception:
+        pass
 
-        res = cv2.matchTemplate(gray, template, cv2.TM_CCOEFF_NORMED)
-        loc = np.where(res >= threshold)
-        for pt in zip(*loc[::-1]):
-            h, w = template.shape
-            resultados.append((pt, w, h))
-            detectou = True
-
-
-    passos = 60
-    direction = 1
-    pos = 0
-    brilho_base = 0.2  # rastro inicial
-
-    for _ in range(passos * 2):
-        overlay = frame.copy()
-
-        # posição das linhas
-        y = int((altura / passos) * pos)
-        x = int((largura / passos) * pos)
-
-        # desenha linhas scanner
-        cv2.line(overlay, (0, y), (largura, y), (0, 0, 255), 2)
-        cv2.line(overlay, (x, 0), (x, altura), (255, 0, 0), 2)
-
-        # rastro com variação de brilho
-        alpha = brilho_base + 0.6 * (pos / passos)
-        blend = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-
-        # desenha os quadrados dos resultados
-        for (pt, w, h) in resultados:
-            cv2.rectangle(blend[y1:y2, x1:x2], pt, (pt[0]+w, pt[1]+h), (0, 255, 0), 2)
-
-        # efeito de brilho pulsante nas linhas
-        linha_intensity = int(255 * abs((pos/passos) - 0.5) * 2)
-        cv2.line(blend, (0, y), (largura, y), (linha_intensity, 0, 255), 2)
-        cv2.line(blend, (x, 0), (x, altura), (0, linha_intensity, 255), 2)
-
-        cv2.imshow("Scanner", blend)
-        cv2.waitKey(1)
-        time.sleep(delay)
-
-        # atualiza posição
-        pos += direction
-        if pos >= passos or pos <= 0:
-            direction *= -1
-
-    if detectou:
+    if resultados:
+        detectou = True
+        # tenta pegar tempo atual do player via DOM (se disponível)
         try:
-            tempo_element = driver.find_element(
-                By.XPATH, '//*[@id="movie_player"]/div[27]/div[2]/div[1]/div[1]/span[1]/div/span[2]'
-            )
-            tempo_live = tempo_element.text.strip()
-        except:
+            tempo_element = driver.execute_script("""
+                try {
+                    const s = document.querySelector('#movie_player .ytp-time-display .ytp-time-current');
+                    return s ? s.innerText.trim() : null;
+                } catch(e) {
+                    return null;
+                }
+            """)
+            tempo_live = tempo_element if tempo_element else None
+        except Exception:
+            tempo_live = None
+
+        if not tempo_live:
             tempo_decorrido = int(time.time() - inicio)
             minutos = tempo_decorrido // 60
             segundos = tempo_decorrido % 60
             tempo_live = f"{minutos:02d}:{segundos:02d}"
 
-    return detectou, tempo_live
+    return detectou, tempo_live, resultados
 
-
-# CONFIGURAR YOUTUBE
-# =====================================
-def configurar_youtube(driver):
-    driver.maximize_window()
-    wait = WebDriverWait(driver, 15)
-
-    # Reduzir zoom
-    driver.execute_script("document.body.style.zoom='80%'")
-
-    # Mais detalhes
-    try:
-        mais_detalhes = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="expand"]')))
-        mais_detalhes.click()
-        print("ℹ️ Mais detalhes clicado")
-    except:
-        print("⚠️ Botão Mais detalhes não encontrado ou não aplicável")
-
-
-
-    # Clicar no play
-    try:
-        play_btn = wait.until(EC.element_to_be_clickable(
-            (By.XPATH, '//*[@id="movie_player"]//button[contains(@class,"ytp-large-play-button")]')))
-        play_btn.click()
-        print("▶️ Play clicado pelo botão")
-    except:
-        print("⚠️ Botão Play não encontrado, tentando clicar na área do vídeo...")
-        try:
-            video_area = wait.until(EC.element_to_be_clickable((By.XPATH, '//*[@id="movie_player"]')))
-            video_area.click()
-            print("▶️ Play clicado na área do vídeo")
-        except:
-            print("⚠️ Não foi possível iniciar o vídeo")
-
-# MONITORAR LIVE (usa scanner e detecta logos)
-# =====================================
 def monitorar_live(templates, pasta_evidencias):
     try:
-        chrome_options = Options()
-        chrome_options.add_argument("--start-maximized")
-        driver = webdriver.Chrome(options=chrome_options)
+        driver = criar_driver_stealth()
         driver.get(LINK_VIDEO)
-        configurar_youtube(driver)
-        print("🚀 Live aberta e escaneando...")
+        time.sleep(2)
+        configurar_youtube(driver=None)  # chamada leve apenas para manter interface compatível
+        ensure_play(driver)
+        print("🚀 Live aberta e iniciada (tentativa).")
 
         global inicio
         inicio = time.time()
 
+        ciclo = 0
         while not status_monitoramento["parar"]:
             if status_monitoramento["rodando"]:
+                ciclo += 1
                 png = driver.get_screenshot_as_png()
                 arr = np.frombuffer(png, dtype=np.uint8)
                 frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-                detectou, tempo_live = detectar_logo_com_scanner(frame, templates, driver, inicio)
+                # detecta
+                detectou, tempo_live, resultados = detectar_logo_com_scanner(frame, templates, driver, inicio)
 
                 if detectou:
-                    nome_arquivo = f"{NOME_DA_LIVE}_{tempo_live.replace(':','-')}.png"
+                    nome_arquivo = f"{NOME_DA_LIVE}_{tempo_live.replace(':','-')}_{ciclo}.png"
                     caminho_arquivo = os.path.join(pasta_evidencias, nome_arquivo)
                     cv2.imwrite(caminho_arquivo, frame)
                     print(f"✅ Logo detectado ({tempo_live}) — print salvo: {caminho_arquivo}")
 
+                    # salva thumbnails das detecções
+                    for idx, (box, score, t_idx) in enumerate(resultados):
+                        ax1, ay1, ax2, ay2 = box
+                        # corta com margem
+                        pad = 6
+                        sx1, sy1 = max(0, ax1-pad), max(0, ay1-pad)
+                        sx2, sy2 = min(frame.shape[1], ax2+pad), min(frame.shape[0], ay2+pad)
+                        thumb = frame[sy1:sy2, sx1:sx2]
+                        thumb_name = f"{NOME_DA_LIVE}_{tempo_live.replace(':','-')}_det{idx}_t{t_idx}.png"
+                        cv2.imwrite(os.path.join(pasta_evidencias, thumb_name), thumb)
+                        print(f"   ↳ thumbnail salvo: {thumb_name} (score {score:.2f})")
+
+                # ação humana leve periodicamente
+                if SIMULATE_USER and random.random() < 0.15:
+                    simulate_small_user_action(driver)
+
                 time.sleep(INTERVALO)
             else:
-                time.sleep(1)
+                time.sleep(0.5)
 
     except Exception as e:
         print("❌ Erro no monitoramento:", e)
     finally:
-        cv2.destroyAllWindows()
-        driver.quit()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+        try:
+            driver.quit()
+        except Exception:
+            pass
         print("🛑 Monitoramento encerrado.")
 
-# INTERFACE
-# =====================================
+# ===================== FUNÇÃO DE CONFIGURAR YOUTUBE (compatível) =====================
+def configurar_youtube(driver):
+    """
+    Função simplificada mantida para compatibilidade. 
+    O driver principal já aplica 'ensure_play' e ações.
+    """
+    # função intencionalmente leve (chamada no monitor)
+    return
+
+# ===================== INTERFACE =====================
 def iniciar_interface():
     root = Tk()
     root.title(f"Controle Live - {NOME_DA_LIVE} Desenvolvido por Diego Oliveira")
-    root.geometry("250x150+50+50")
+    root.geometry("300x170+50+50")
     root.attributes("-topmost", True)
-    root.attributes("-alpha", 0.2) # Aqui altero entre 0.2  até 1.0 para ajustar a transparencia da janela aux. 
+    root.attributes("-alpha", 0.25)
 
     def on_enter(event): root.attributes("-alpha", 0.5)
     def on_leave(event): root.attributes("-alpha", 0.3)
@@ -239,33 +462,38 @@ def iniciar_interface():
     def pausar():
         status_monitoramento["rodando"] = not status_monitoramento["rodando"]
         btn_pausar.config(text="Continuar" if not status_monitoramento["rodando"] else "Pausar")
-
-    btn_pausar = Button(root, text="Pausar", width=15, bg="green", fg="white",
+    btn_pausar = Button(root, text="Pausar", width=18, bg="green", fg="white",
                         font=("Arial", 12, "bold"), command=pausar)
-    btn_pausar.pack(pady=10)
+    btn_pausar.pack(pady=8)
 
     def parar():
         status_monitoramento["parar"] = True
         root.destroy()
-
-    btn_parar = Button(root, text="⛔ Parar", width=15, bg="red", fg="white",
+    btn_parar = Button(root, text="⛔ Parar", width=18, bg="red", fg="white",
                        font=("Arial", 12, "bold"), command=parar)
-    btn_parar.pack(pady=10)
+    btn_parar.pack(pady=6)
 
     root.mainloop()
 
-# EXECUÇÃO PRINCIPAL
-# ===================================== 
-logos_selecionados = selecionar_logos()
-if not logos_selecionados:
-    raise Exception("Nenhum logo selecionado!")
+# ===================== EXECUÇÃO PRINCIPAL =====================
+if __name__ == "__main__":
+    logos_selecionados = selecionar_logos()
+    if not logos_selecionados:
+        raise Exception("Nenhum logo selecionado!")
 
-templates = [cv2.imread(l, cv2.IMREAD_GRAYSCALE) for l in logos_selecionados]
+    # carrega templates em grayscale
+    templates = []
+    for l in logos_selecionados:
+        t = cv2.imread(l, cv2.IMREAD_GRAYSCALE)
+        if t is None:
+            print("⚠️ Não foi possível abrir template:", l)
+        else:
+            templates.append(t)
 
-pasta_base, pasta_evidencias = preparar_pastas(NOME_DA_LIVE)
-print("📁 Salvando prints em:", pasta_evidencias)
+    pasta_base, pasta_evidencias = preparar_pastas(NOME_DA_LIVE)
+    print("📁 Salvando prints em:", pasta_evidencias)
 
-t_monitor = threading.Thread(target=monitorar_live, args=(templates, pasta_evidencias))
-t_monitor.start()
+    t_monitor = threading.Thread(target=monitorar_live, args=(templates, pasta_evidencias), daemon=True)
+    t_monitor.start()
 
-iniciar_interface()
+    iniciar_interface()
