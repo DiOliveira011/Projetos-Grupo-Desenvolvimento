@@ -36,3 +36,22 @@ def tamanho_amostra_proporcao(p, erro, confianca=0.95, N=None):
 # Exemplo de uso:
 n = tamanho_amostra_proporcao(p=0.5, erro=0.05, confianca=0.95, N=100000)
 print(n)
+
+# 2. Calculadora de produto vetorial entre 2 vetores 
+#  Material de apoio: https://www.wolframalpha.com/input/?i=cross+product+calculator
+# https://www.mathsisfun.com/algebra/vectors-cross-product.html
+
+def produto_vetorial(v1, v2):
+    x = v1[1] * v2[2] - v1[2] * v2[1]
+    y = v1[2] * v2[0] - v1[0] * v2[2]
+    z = v1[0] * v2[1] - v1[1] * v2[0]
+    return [x, y, z]
+
+# Recursos para testes
+# Cria os vetores
+vetor_a = [2, -3, 1]
+vetor_b = [5, 7, 6]
+
+# Calculando o produto vetorial
+resultado = produto_vetorial(vetor_a, vetor_b)
+print("Produto Vetorial:", resultado)
